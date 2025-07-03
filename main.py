@@ -4,11 +4,12 @@ from pydantic import BaseModel, Field
 from ultralytics import YOLO
 import os
 import shutil
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 import io
 import numpy as np
 import cv2
+import easyocr
 
 # ?  SETUP
 logging.basicConfig(level=logging.INFO)
@@ -21,11 +22,14 @@ app = FastAPI(
 )
 
 # ?  MODEL PATHS
-MODEL_PATH_DANGEROUS = "models/xray_cargo_dangerous.pt"
-MODEL_PATH_ITEMS = "models/xray_cargo_items.pt"
-
+MODEL_PATH_DANGEROUS = "models/xray_cargo_dangerous_model.pt"
+MODEL_PATH_ITEMS = "models/xray_cargo_items_model.pt"
+MODEL_PATH_OCR_DETECTOR = "models/container_id_model.pt"
 # ?  LOAD MODELS
+
+
 models = {}
+reader = None # ? <-- default ocr
 try:
     if os.path.exists(MODEL_PATH_DANGEROUS):
         models["dangerous_goods"] = YOLO(MODEL_PATH_DANGEROUS)
@@ -45,6 +49,21 @@ except Exception as e:
     logger.error(f"Failed to load Item Types model: {e}")
 
 
+try:
+    if os.path.exists(MODEL_PATH_OCR_DETECTOR):
+        models["ocr_detector"] = YOLO(MODEL_PATH_OCR_DETECTOR)
+        logger.info(f"Container ID detector model loaded from: {MODEL_PATH_OCR_DETECTOR}")
+    else:
+        logger.warning(f"Container ID model not found at: {MODEL_PATH_OCR_DETECTOR}")
+except Exception as e:
+    logger.error(f"Failed to load Container ID model: {e}")
+
+try:
+    reader = easyocr.Reader(['en']) # 'en' for English
+    logger.info("EasyOCR reader initialized successfully.")
+except Exception as e:
+    logger.error(f"Failed to initialize EasyOCR reader: {e}")
+
 # ?  RESPONSE MODELS
 
 # ? For Object Detection (Dangerous Goods)
@@ -59,10 +78,21 @@ class DetectionResult(BaseModel):
     confidence: float
     box: DetectionBox
 
+class OCRDetectionResult(BaseModel):
+    class_name: str
+    confidence: float
+    box: DetectionBox
+    ocr_text: Optional[str] = Field(None, description="Text read from the detected box, if applicable.")
+
+
 class DetectionResponse(BaseModel):
     filename: str
     model_used: str
     detections: List[DetectionResult]
+
+class OCRResponse(BaseModel):
+    filename: str
+    detections: List[OCRDetectionResult]
 
 # ?  For Instance Segmentation (Item Types)
 class Point(BaseModel):
@@ -120,6 +150,28 @@ def draw_segmentations(image: np.ndarray, detections: List[SegmentationResult]) 
 
     return image
 
+def draw_ocr_detections(image: np.ndarray, detections: List[OCRDetectionResult]) -> np.ndarray:
+    for detection in detections:
+        box = detection.box
+        class_name = detection.class_name
+        confidence = detection.confidence
+        ocr_text = detection.ocr_text
+
+        # ? define color based on whether OCR text was found
+        color = (0, 255, 0) if ocr_text else (0, 0, 255) # Green for OCR, Red for no OCR
+
+        # ? draw the bounding box
+        cv2.rectangle(image, (box.x1, box.y1), (box.x2, box.y2), color, 2)
+
+        # ? dreate the label for the top of the box
+        label = f"{class_name}: {confidence:.2f}"
+        cv2.putText(image, label, (box.x1, box.y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        #  ? iff OCR text was found, draw it below the box
+        if ocr_text:
+            cv2.putText(image, ocr_text, (box.x1, box.y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    return image
+
 # ?  INFERENCE PROCESSING
 
 # ? For Object Detection models
@@ -170,6 +222,51 @@ def process_segmentation_inference(model: YOLO, image: np.ndarray) -> List[Segme
     return detections
 
 
+def run_ocr_pipeline(detector_model: YOLO, ocr_reader: easyocr.Reader, image: np.ndarray) -> List[OCRDetectionResult]:
+    """Runs the full Detect -> Crop -> OCR pipeline and returns structured data."""
+
+    # ? STEP 1 (pipeline ): DETECT text boxes with YOLOv8
+    results = detector_model(image)
+    final_detections = []
+
+    for r in results:
+        # ? get detection data
+        for box in r.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            class_name = detector_model.names[cls_id]
+
+            ocr_text_result = None
+            # ? check if the detected object should have OCR run on it
+            if class_name in ['ID', 'Chassis ID']:
+
+                 # ? STEP 2 (pipeline): CROP the image to just the detected box
+                cropped_image = image[y1:y2, x1:x2]
+
+                # ?  Optional (recommended): Pre-process the cropped image for better OCR
+                # ? Convert to grayscale
+                gray_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
+
+                # ? STEP 3 (pipeline): READ the text from the cropped image
+                ocr_results = ocr_reader.readtext(gray_image)
+
+                # ? Process OCR results
+                if ocr_results:
+
+                    # ?  join all found text pieces together with a space
+                    ocr_text_result = " ".join([res[1] for res in ocr_results])
+                    logger.info(f"OCR found text: '{ocr_text_result}' in a '{class_name}' box.")
+            # ? append the final result (with or without OCR text)
+            final_detections.append(OCRDetectionResult(
+                class_name=class_name,
+                confidence=round(conf, 2),
+                box=DetectionBox(x1=x1, y1=y1, x2=x2, y2=y2),
+                ocr_text=ocr_text_result
+            ))
+    return final_detections
+
+
 # ?  API ENDPOINTS
 
 # ? DANGEROUS GOODS (DETECTION)
@@ -214,7 +311,7 @@ async def visualize_dangerous_goods(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail="Failed to encode visualized image.")
     return StreamingResponse(io.BytesIO(buffer), media_type="image/jpeg")
 
-# ?  ITEM TYPES
+# ?  ITEM TYPES (visualize)
 @app.post("/visualize/item-types/", summary="Visualize Item Type Detections (Segmentation)", tags=["Visual Inspection"])
 async def visualize_item_types(file: UploadFile = File(...)):
     model_key = "item_types"
@@ -230,6 +327,61 @@ async def visualize_item_types(file: UploadFile = File(...)):
     if not is_success:
         raise HTTPException(status_code=500, detail="Failed to encode visualized image.")
     return StreamingResponse(io.BytesIO(buffer), media_type="image/jpeg")
+
+
+# ? OCR ENDPOIT
+
+@app.post("/inspect/container-with-ocr/", response_model=OCRResponse, tags=["JSON Inspection"])
+async def inspect_container_with_ocr(file: UploadFile = File(...)):
+    detector_model = models.get("ocr_detector")
+    if not detector_model or not reader:
+        raise HTTPException(status_code=500, detail="A required model or reader is not available.")
+
+     # ? read & decode the image
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    # ? RUEN THE FULL PIPELINE
+    detections = run_ocr_pipeline(detector_model, reader, img)
+
+    return OCRResponse(filename=file.filename, detections=detections)
+
+
+@app.post("/visualize/container-with-ocr/", summary="Visualize Container Detections with OCR", tags=["Visual Inspection"])
+async def visualize_container_with_ocr(file: UploadFile = File(...)):
+
+    detector_model = models.get("ocr_detector")
+    if not detector_model or not reader:
+        raise HTTPException(status_code=500, detail="A required model or reader is not available.")
+
+    # ? Read and decode the image
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    # ? Run the full pipeline to get detections with OCR text
+    detections = run_ocr_pipeline(detector_model, reader, img)
+
+    # ? Draw the results on the image
+    img_with_detections = draw_ocr_detections(img, detections)
+
+    # ? Encode the image to be sent in the response
+    is_success, buffer = cv2.imencode(".jpg", img_with_detections)
+    if not is_success:
+        raise HTTPException(status_code=500, detail="Failed to encode visualized image.")
+
+    return StreamingResponse(io.BytesIO(buffer), media_type="image/jpeg")
+
+
+# ? Root/Health Check Endpoint
+@app.get("/", summary="Health Check", tags=["General"])
+def read_root():
+    return {
+        "status": "Cargovision OCR API is running!",
+        "loaded_models": list(models.keys()),
+        "ocr_reader_loaded": reader is not None
+    }
 
 
 # ?  ROOT ENDPOINT
